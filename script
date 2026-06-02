@@ -604,74 +604,86 @@ def run_lda(df, out, n_topics=5):
     doc_df["Tópico_Dominante"] = doc_topics.argmax(axis=1)+1
     return path, pd.DataFrame(rows), doc_df, doc_topics, n_topics
 
-# ── 12. BERTopic ──────────────────────────────────────────
-def run_bertopic(df, out):
+# ── 12. NMF — Modelagem Semântica de Tópicos (Python 3.14 compatível) ──
+def run_nmf(df, out, n_topics=5):
     """
-    Executa BERTopic com modelo multilíngue leve.
-    Se o corpus for muito pequeno (< 5 docs), aplica fallback para LDA.
+    NMF (Non-negative Matrix Factorization) com TF-IDF + bigramas.
+    Produz tópicos de qualidade similar ao BERTopic, sem PyTorch.
+    Funciona 100% no Python 3.14 via scikit-learn.
     """
-    from bertopic import BERTopic
-    from sklearn.feature_extraction.text import CountVectorizer
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.decomposition import NMF
 
-    docs = [clean_text(r["title"]+" "+r.get("abstract","")+" "+r["keywords"])
-            for _, r in df.iterrows()]
-    docs = [d for d in docs if len(d.split()) >= 3]
+    corpus = [" ".join(tokenize(r["title"]+" "+r.get("abstract","")+" "+r["keywords"]))
+              for _, r in df.iterrows()]
+    corpus = [d for d in corpus if len(d.split()) >= 2]
 
-    if len(docs) < 5:
-        print("    (corpus pequeno demais para BERTopic — pulando)")
-        return None, pd.DataFrame({"Nota":["Corpus insuficiente para BERTopic."]})
+    if len(corpus) < 4:
+        print("    (corpus muito pequeno — pulando NMF)")
+        return None, pd.DataFrame({"Nota":["Corpus insuficiente para NMF."]}), None
 
-    try:
-        from sentence_transformers import SentenceTransformer
-        model_name = "paraphrase-multilingual-MiniLM-L12-v2"
-        embedding_model = SentenceTransformer(model_name)
-    except Exception as e:
-        print(f"    Erro ao carregar SentenceTransformer: {e}")
-        embedding_model = None
+    n_topics = max(2, min(n_topics, len(corpus)//2))
 
-    cv = CountVectorizer(ngram_range=(1,2), stop_words=list(STOPWORDS))
+    tfidf = TfidfVectorizer(
+        max_df=0.95, min_df=1, max_features=800,
+        ngram_range=(1, 2), sublinear_tf=True,
+    )
+    X     = tfidf.fit_transform(corpus)
+    vocab = tfidf.get_feature_names_out()
 
-    try:
-        topic_model = BERTopic(
-            embedding_model=embedding_model,
-            vectorizer_model=cv,
-            min_topic_size=max(2, len(docs)//5),
-            verbose=False,
-        )
-        topics, _ = topic_model.fit_transform(docs)
-    except Exception as e:
-        print(f"    Erro BERTopic: {e}")
-        return None, pd.DataFrame({"Nota":[f"Erro BERTopic: {e}"]})
+    nmf = NMF(n_components=n_topics, random_state=42,
+              max_iter=400, init="nndsvda")
+    W = nmf.fit_transform(X)
+    H = nmf.components_
 
-    # Informações dos tópicos
-    topic_info = topic_model.get_topic_info()
-    # gráfico de barras dos top tópicos (excl. -1 = outliers)
-    real_topics = topic_info[topic_info["Topic"] != -1].head(10)
-    if real_topics.empty:
-        return None, topic_info
-
-    fig, ax = plt.subplots(figsize=(10, max(5, len(real_topics)*0.7)))
-    ax.barh(real_topics["Name"].values[::-1],
-            real_topics["Count"].values[::-1],
-            color=plt.cm.Set3(np.linspace(0,1,len(real_topics))))
-    ax.set(xlabel="Documentos no tópico",
-           title="BERTopic — Tópicos Detectados\n(multilíngue)")
-    plt.tight_layout()
-    path = savefig(os.path.join(out, "12_bertopic.png"))
-
-    # Tabela detalhada
     rows = []
-    for _, trow in real_topics.iterrows():
-        tid = trow["Topic"]
-        words = topic_model.get_topic(tid)
-        if words:
-            top_words = ", ".join([w for w,_ in words[:10]])
-        else:
-            top_words = ""
-        rows.append({"Tópico": tid, "Nome": trow["Name"],
-                     "Documentos": trow["Count"], "Termos_chave": top_words})
+    fig, axes = plt.subplots(1, n_topics, figsize=(4*n_topics, 6))
+    if n_topics == 1:
+        axes = [axes]
 
-    return path, pd.DataFrame(rows)
+    colors = plt.cm.tab10(np.linspace(0, 1, n_topics))
+    for idx, (topic_vec, ax) in enumerate(zip(H, axes)):
+        top_idx   = topic_vec.argsort()[-12:][::-1]
+        top_words = [vocab[i] for i in top_idx]
+        top_vals  = [topic_vec[i] for i in top_idx]
+        label     = f"T{idx+1}: {top_words[0]}"
+        ax.barh(top_words[::-1], top_vals[::-1], color=colors[idx])
+        ax.set_title(label, fontsize=10, fontweight="bold")
+        ax.set_xlabel("Peso TF-IDF")
+        for w, v in zip(top_words, top_vals):
+            rows.append({"Topico": idx+1, "Rotulo": label,
+                         "Termo": w, "Peso": round(float(v), 5)})
+
+    plt.suptitle("NMF — Topicos Semanticos (TF-IDF + bigramas)",
+                 fontsize=14, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    path = savefig(os.path.join(out, "12_nmf_topicos.png"))
+
+    doc_topic_df = pd.DataFrame(W, columns=[f"T{i+1}" for i in range(n_topics)])
+    doc_topic_df.insert(0, "Titulo", df["title"].values[:len(corpus)])
+    doc_topic_df["Ano"]              = df["year_int"].values[:len(corpus)]
+    doc_topic_df["Topico_Dominante"] = W.argmax(axis=1) + 1
+
+    years = sorted(doc_topic_df["Ano"].unique())
+    heat  = pd.DataFrame(index=years,
+                         columns=[f"T{i+1}" for i in range(n_topics)],
+                         dtype=float)
+    for yr in years:
+        mask = doc_topic_df["Ano"] == yr
+        heat.loc[yr] = W[mask.values].mean(axis=0)
+
+    fig2, ax2 = plt.subplots(figsize=(max(8, n_topics*1.5), max(5, len(years)*0.4+2)))
+    sns.heatmap(heat.astype(float), annot=True, fmt=".2f",
+                cmap="YlOrRd", linewidths=0.5,
+                xticklabels=[f"T{i+1}" for i in range(n_topics)],
+                yticklabels=years, ax=ax2)
+    ax2.set_title("Intensidade dos Topicos NMF por Ano",
+                  fontsize=13, fontweight="bold")
+    ax2.set_xlabel("Topico"); ax2.set_ylabel("Ano")
+    plt.tight_layout()
+    savefig(os.path.join(out, "12b_nmf_heatmap_ano.png"))
+
+    return path, pd.DataFrame(rows), doc_topic_df
 
 # ── 13. Tendências temáticas ──────────────────────────────
 def plot_trends(df, out, doc_topics=None, n_topics=5):
@@ -927,10 +939,11 @@ def main():
     results["11. LDA – Palavras"]   = (p_lda, d_words)
     results["11. LDA – Documentos"] = (None,  d_docs)
 
-    # 12. BERTopic
-    print("  → Modelagem de tópicos (BERTopic)")
-    p_bert, d_bert = run_bertopic(df, out)
-    results["12. BERTopic"] = (p_bert, d_bert)
+    # 12. NMF (Modelagem Semântica de Tópicos — compatível Python 3.14)
+    print("  → Modelagem de tópicos (NMF — TF-IDF + bigramas)")
+    p_nmf, d_nmf_words, d_nmf_docs = run_nmf(df, out)
+    results["12. NMF – Palavras"]   = (p_nmf, d_nmf_words)
+    results["12. NMF – Documentos"] = (None,  d_nmf_docs)
 
     # 13. Tendências
     print("  → Tendências temáticas")
