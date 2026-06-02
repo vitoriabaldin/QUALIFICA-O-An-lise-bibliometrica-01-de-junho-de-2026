@@ -1,14 +1,15 @@
 """
 =============================================================
   ANÁLISE BIBLIOMÉTRICA COMPLETA — PORTAL CAPES
-  v2.0  |  Saída: XLSX + PNGs
+  v3.0 — Produção Nacional PT-BR  |  Saída: XLSX + PNGs
 =============================================================
 FUNCIONALIDADES
   1.  Evolução temporal das publicações
   2.  Principais autores
   3.  Principais periódicos
   4.  Instituições mais produtivas   ← enriquecido via OpenAlex
-  5.  Países mais produtivos         ← enriquecido via OpenAlex
+  5.  Distribuição por estado/região brasileira
+  5b. Filtro automático de idioma (mantém português)
   6.  Rede de coautoria
   7.  Rede de cocitação
   8.  Acoplamento bibliográfico
@@ -17,7 +18,7 @@ FUNCIONALIDADES
   11. Modelagem de tópicos — LDA
   12. Modelagem de tópicos — BERTopic ← novo
   13. Tendências temáticas ao longo do tempo
-  14. Mapa de colaboração internacional
+  14. Análise Qualis CAPES (distribuição, ranking, evolução temporal)
 
 SAÍDAS
   resultados/relatorio_bibliometrico.xlsx  ← planilha com abas por análise
@@ -217,75 +218,445 @@ def load_bib_files(paths):
 
 
 # ══════════════════════════════════════════════════════════
-# 2. ENRIQUECIMENTO VIA OPENALEX
 # ══════════════════════════════════════════════════════════
-def _openalex_fetch(doi: str, email: str):
-    doi_clean = doi.strip().lower()
-    if not doi_clean:
-        return None
-    url = f"https://api.openalex.org/works/doi:{doi_clean}"
-    try:
-        r = requests.get(url, params={"mailto": email}, timeout=12)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
+# 2. ENRIQUECIMENTO EM CASCATA
+#    SciELO → Crossref → Semantic Scholar → OpenAlex → Unpaywall
+# ══════════════════════════════════════════════════════════
+
+import html as _html
+
+def _get(url, params=None, timeout=12):
+    """GET com retry simples."""
+    for attempt in range(2):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r
+        except Exception:
+            time.sleep(1)
     return None
 
+def _clean_abstract(text: str) -> str:
+    """Remove tags HTML e entidades."""
+    if not text:
+        return ""
+    text = _html.unescape(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
-def enrich_with_openalex(df: pd.DataFrame, email: str) -> pd.DataFrame:
+# ── SciELO ───────────────────────────────────────────────
+def _scielo_fetch(doi: str, title: str) -> dict:
     """
-    Para cada DOI consulta a API OpenAlex e extrai:
-      - institution_name, institution_country, country_code, ror
-    Aguarda 0.2 s entre requisições (polite pool).
+    Tenta pelo DOI primeiro; se falhar, busca por título.
+    Retorna dict com: abstract, keywords, affiliation, country_code, doc_type
     """
-    print("  → Enriquecendo via OpenAlex (pode demorar alguns minutos)…")
-    inst_names, inst_countries, country_codes = [], [], []
+    result = {}
+    r = None
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="  OpenAlex"):
-        data = _openalex_fetch(row["doi"], email)
-        if data is None:
-            inst_names.append("")
-            inst_countries.append("")
-            country_codes.append("")
+    # 1) busca por DOI
+    if doi:
+        doi_clean = doi.strip()
+        for prefix in ("https://doi.org/", "http://doi.org/",
+                       "https://dx.doi.org/", "http://dx.doi.org/"):
+            doi_clean = doi_clean.replace(prefix, "")
+        r = _get("https://articlemeta.scielo.org/api/v1/article/",
+                 params={"doi": doi_clean, "format": "json"})
+        if r is None:
+            r = _get("https://articlemeta.scielo.org/api/v1/article/",
+                     params={"code": doi_clean, "format": "json"})
+
+    # 2) busca por título se DOI falhou
+    if r is None and title:
+        r2 = _get("https://search.scielo.org/api/v1/search/",
+                  params={"q": f'ti:"{title[:80]}"', "count": 1, "format": "json"})
+        if r2:
+            try:
+                hits = r2.json().get("hits", {}).get("hits", [])
+                if hits:
+                    pid = hits[0].get("_id", "")
+                    if pid:
+                        r = _get("https://articlemeta.scielo.org/api/v1/article/",
+                                 params={"code": pid, "format": "json"})
+            except Exception:
+                pass
+
+    if r is None:
+        return result
+
+    try:
+        data = r.json()
+    except Exception:
+        return result
+
+    # data pode ser None, lista ou dict dependendo do endpoint
+    if not isinstance(data, dict):
+        return result
+
+    # article pode ser None em algumas respostas
+    article = data.get("article") or {}
+    title_meta = data.get("title") or {}
+
+    # abstract — pega pt, es ou en
+    abst_dict = article.get("v83") or []
+    if isinstance(abst_dict, list):
+        for item in abst_dict:
+            if not isinstance(item, dict):
+                continue
+            lang = item.get("l", "")
+            text = item.get("_", "")
+            if text:
+                result.setdefault("abstract", _clean_abstract(text))
+                if lang in ("pt", "es"):
+                    result["abstract"] = _clean_abstract(text)
+                    break
+
+    # keywords
+    kw_dict = article.get("v85") or []
+    if isinstance(kw_dict, list):
+        kws = [item.get("_", "") for item in kw_dict
+               if isinstance(item, dict) and item.get("_")]
+        if kws:
+            result["keywords"] = "; ".join(kws)
+
+    # afiliação
+    aff_list = article.get("v240") or []
+    if isinstance(aff_list, list):
+        affs = [item.get("_", "") for item in aff_list
+                if isinstance(item, dict) and item.get("_")]
+        if affs:
+            result["affiliation"] = "; ".join(affs)
+
+    # país via journal country
+    try:
+        v310 = title_meta.get("v310") or [{}]
+        country = v310[0].get("_", "") if isinstance(v310, list) else ""
+        if country:
+            result["country_code"] = country.upper()[:2]
+    except Exception:
+        pass
+
+    # tipo de documento
+    try:
+        v71 = article.get("v71") or [{}]
+        doc_type = v71[0].get("_", "") if isinstance(v71, list) else ""
+        if doc_type:
+            result["doc_type"] = doc_type
+    except Exception:
+        pass
+
+    return result
+
+# ── Crossref ─────────────────────────────────────────────
+def _crossref_fetch(doi: str, email: str) -> dict:
+    if not doi:
+        return {}
+    result = {}
+    url = f"https://api.crossref.org/works/{requests.utils.quote(doi.strip(), safe='')}"
+    r = _get(url, params={"mailto": email})
+    if r is None:
+        return result
+    try:
+        msg = r.json().get("message", {})
+    except Exception:
+        return result
+
+    # abstract
+    abst = msg.get("abstract", "")
+    if abst:
+        result["abstract"] = _clean_abstract(abst)
+
+    # tipo de documento
+    result["doc_type"] = msg.get("type", "")
+
+    # afiliação e país
+    insts, codes = [], []
+    for auth in msg.get("author", []):
+        for aff in auth.get("affiliation", []):
+            name = aff.get("name", "")
+            if name:
+                insts.append(name)
+    if insts:
+        result["affiliation"] = "; ".join(dict.fromkeys(insts))
+
+    # referências (lista de DOIs citados)
+    refs = []
+    for ref in msg.get("reference", []):
+        rdoi = ref.get("DOI", "")
+        if rdoi:
+            refs.append(rdoi)
+    if refs:
+        result["references"] = refs
+
+    return result
+
+# ── Semantic Scholar ──────────────────────────────────────
+def _s2_fetch(doi: str, title: str, api_key: str = "") -> dict:
+    result = {}
+    fields  = "title,abstract,authors,year,externalIds,tldr,topics"
+    r = None
+
+    # por DOI
+    if doi:
+        r = _get(f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi.strip()}",
+                 params={"fields": fields})
+        if r is None and api_key:
+            time.sleep(1)
+
+    # por título se DOI falhou
+    if (not doi or r is None) and title:
+        r = _get("https://api.semanticscholar.org/graph/v1/paper/search",
+                 params={"query": title[:120], "fields": fields, "limit": 1})
+        if r:
+            try:
+                items = r.json().get("data", [])
+                r = None
+                if items:
+                    pid = items[0].get("paperId", "")
+                    r = _get(f"https://api.semanticscholar.org/graph/v1/paper/{pid}",
+                             params={"fields": fields}) if pid else None
+            except Exception:
+                r = None
+
+    if r is None:
+        return result
+
+    try:
+        data = r.json()
+    except Exception:
+        return result
+
+    abst = data.get("abstract") or ""
+    if abst:
+        result["abstract"] = _clean_abstract(abst)
+
+    # tldr como fallback de abstract curto
+    tldr = (data.get("tldr") or {}).get("text", "")
+    if tldr and not result.get("abstract"):
+        result["abstract"] = tldr
+
+    # tópicos
+    topics = [t.get("topic", "") for t in data.get("topics", []) if t.get("topic")]
+    if topics:
+        result["keywords"] = "; ".join(topics[:10])
+
+    return result
+
+# ── OpenAlex ──────────────────────────────────────────────
+def _openalex_fetch(doi: str, title: str, email: str) -> dict:
+    result = {}
+
+    # por DOI
+    r = None
+    if doi:
+        r = _get(f"https://api.openalex.org/works/doi:{doi.strip()}",
+                 params={"mailto": email})
+
+    # por título
+    if r is None and title:
+        r = _get("https://api.openalex.org/works",
+                 params={"filter": f'title.search:{title[:100]}',
+                         "per-page": 1, "mailto": email})
+        if r:
+            try:
+                items = r.json().get("results", [])
+                r = None
+                if items:
+                    wid = items[0].get("id", "").replace("https://openalex.org/", "")
+                    r = _get(f"https://api.openalex.org/works/{wid}",
+                             params={"mailto": email}) if wid else None
+            except Exception:
+                r = None
+
+    if r is None:
+        return result
+
+    try:
+        data = r.json()
+    except Exception:
+        return result
+
+    # abstract (OpenAlex armazena como inverted index)
+    inv = data.get("abstract_inverted_index") or {}
+    if inv:
+        try:
+            words = {pos: w for w, positions in inv.items() for pos in positions}
+            result["abstract"] = " ".join(words[i] for i in sorted(words))
+        except Exception:
+            pass
+
+    # keywords / concepts
+    concepts = [c.get("display_name", "") for c in data.get("concepts", [])
+                if c.get("score", 0) > 0.3]
+    if concepts:
+        result["keywords"] = "; ".join(concepts[:10])
+
+    # instituição e país
+    insts, codes = [], []
+    for auth in data.get("authorships", []):
+        for inst in auth.get("institutions", []):
+            n = inst.get("display_name", "")
+            c = inst.get("country_code", "")
+            if n: insts.append(n)
+            if c: codes.append(c)
+    if insts:
+        result["affiliation"] = "; ".join(dict.fromkeys(insts))
+    if codes:
+        result["country_code"] = "; ".join(dict.fromkeys(codes))
+
+    # tipo
+    result["doc_type"] = data.get("type", "")
+
+    return result
+
+# ── Unpaywall ─────────────────────────────────────────────
+def _unpaywall_fetch(doi: str, email: str) -> dict:
+    if not doi:
+        return {}
+    r = _get(f"https://api.unpaywall.org/v2/{requests.utils.quote(doi.strip(), safe='')}",
+             params={"email": email})
+    if r is None:
+        return {}
+    try:
+        data = r.json()
+    except Exception:
+        return {}
+
+    result = {}
+    result["doc_type"]     = data.get("genre", "")
+    result["is_oa"]        = str(data.get("is_oa", ""))
+    result["oa_url"]       = (data.get("best_oa_location") or {}).get("url_for_pdf", "")
+    result["journal_issn"] = data.get("journal_issn_l", "")
+    return result
+
+# ── CASCATA PRINCIPAL ─────────────────────────────────────
+_DOC_TYPE_NOISE = {
+    "book-chapter", "book", "proceedings-article",
+    "review", "editorial", "letter", "erratum",
+    "resenha", "editorial", "carta"
+}
+
+def enrich_cascade(df: pd.DataFrame, email: str, s2_key: str = "") -> pd.DataFrame:
+    """
+    Para cada registro tenta, em cascata:
+      1. SciELO  (melhor para revistas brasileiras)
+      2. Crossref (tipo de documento + referências)
+      3. Semantic Scholar (abstract + tópicos)
+      4. OpenAlex (instituição + país + conceitos)
+      5. Unpaywall (OA + PDF URL)
+
+    Campos preenchidos (nunca sobrescreve dado já existente):
+      enrich_abstract, enrich_keywords, enrich_affiliation,
+      enrich_country_code, enrich_doc_type, enrich_references,
+      enrich_is_oa, enrich_oa_url, enrich_source (quais APIs responderam)
+    """
+    print("\n  Enriquecimento em cascata: SciELO → Crossref → S2 → OpenAlex → Unpaywall")
+    print("  (pode demorar — ~1-2 s por registro)\n")
+
+    cols = ["enrich_abstract","enrich_keywords","enrich_affiliation",
+            "enrich_country_code","enrich_doc_type","enrich_references",
+            "enrich_is_oa","enrich_oa_url","enrich_source","enrich_is_noise"]
+    for c in cols:
+        df[c] = ""
+
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="  Enriquecendo"):
+        doi   = str(row.get("doi",   "") or "").strip()
+        title = str(row.get("title", "") or "").strip()
+        merged = {}
+        sources = []
+
+        def _merge(src_dict, src_name):
+            if not src_dict: return
+            sources.append(src_name)
+            for k, v in src_dict.items():
+                if v and k not in merged:
+                    merged[k] = v
+
+        # 1. SciELO
+        try:
+            time.sleep(0.3)
+            _merge(_scielo_fetch(doi, title), "SciELO")
+        except Exception as e:
+            pass  # falha silenciosa — próxima API
+
+        # 2. Crossref
+        try:
             time.sleep(0.2)
-            continue
+            _merge(_crossref_fetch(doi, email), "Crossref")
+        except Exception:
+            pass
 
-        auths = data.get("authorships", [])
-        insts, ctries, codes = [], [], []
-        for auth in auths:
-            for inst in auth.get("institutions", []):
-                n = inst.get("display_name", "")
-                c = inst.get("country_code", "")
-                if n:
-                    insts.append(n)
-                if c:
-                    codes.append(c)
-                    # reverse lookup pycountry for full name
-                    try:
-                        import pycountry
-                        country_obj = pycountry.countries.get(alpha_2=c)
-                        if country_obj:
-                            ctries.append(country_obj.name)
-                        else:
-                            ctries.append(c)
-                    except Exception:
-                        ctries.append(c)
+        # 3. Semantic Scholar (só se ainda falta abstract)
+        if not merged.get("abstract"):
+            try:
+                time.sleep(1.1)
+                _merge(_s2_fetch(doi, title, s2_key), "S2")
+            except Exception:
+                pass
 
-        inst_names.append("; ".join(dict.fromkeys(insts)))
-        inst_countries.append("; ".join(dict.fromkeys(ctries)))
-        country_codes.append("; ".join(dict.fromkeys(codes)))
-        time.sleep(0.2)
+        # 4. OpenAlex (complementa instituição/país/keywords)
+        if not merged.get("affiliation") or not merged.get("abstract"):
+            try:
+                time.sleep(0.3)
+                _merge(_openalex_fetch(doi, title, email), "OpenAlex")
+            except Exception:
+                pass
 
-    df = df.copy()
-    df["openalex_institution"] = inst_names
-    df["openalex_country"]     = inst_countries
-    df["openalex_country_code"] = country_codes
-    print("  ✓ Enriquecimento concluído\n")
+        # 5. Unpaywall (sempre — para OA e tipo)
+        if doi:
+            try:
+                time.sleep(0.2)
+                _merge(_unpaywall_fetch(doi, email), "Unpaywall")
+            except Exception:
+                pass
+
+        # Grava resultados
+        df.at[idx, "enrich_abstract"]    = merged.get("abstract", "")
+        df.at[idx, "enrich_keywords"]    = merged.get("keywords", "")
+        df.at[idx, "enrich_affiliation"] = merged.get("affiliation", "")
+        df.at[idx, "enrich_country_code"]= merged.get("country_code", "")
+        df.at[idx, "enrich_doc_type"]    = merged.get("doc_type", "")
+        df.at[idx, "enrich_references"]  = "; ".join(merged.get("references", []))
+        df.at[idx, "enrich_is_oa"]       = merged.get("is_oa", "")
+        df.at[idx, "enrich_oa_url"]      = merged.get("oa_url", "")
+        df.at[idx, "enrich_source"]      = ", ".join(sources) if sources else "nenhuma"
+
+        # Marca ruído por tipo de documento
+        doc_type = merged.get("doc_type", "").lower()
+        df.at[idx, "enrich_is_noise"] = "sim" if any(
+            noise in doc_type for noise in _DOC_TYPE_NOISE) else "não"
+
+    # Combina campos originais com enriquecidos (original tem prioridade)
+    df["abstract_final"]  = df.apply(
+        lambda r: r["abstract"]         if r.get("abstract")     else r["enrich_abstract"],  axis=1)
+    df["keywords_final"]  = df.apply(
+        lambda r: r["keywords"]         if r.get("keywords")     else r["enrich_keywords"],  axis=1)
+    df["affiliation_final"]= df.apply(
+        lambda r: r["affiliation"]      if r.get("affiliation")  else r["enrich_affiliation"],axis=1)
+    df["country_final"]   = df.apply(
+        lambda r: r.get("openalex_country_code","") or r["enrich_country_code"], axis=1)
+
+    # Relatório de cobertura
+    total = len(df)
+    print(f"\n  📊 Cobertura após enriquecimento ({total} registros):")
+    print(f"     Abstract    : {df['abstract_final'].ne('').sum():>4} / {total}")
+    print(f"     Keywords    : {df['keywords_final'].ne('').sum():>4} / {total}")
+    print(f"     Afiliação   : {df['affiliation_final'].ne('').sum():>4} / {total}")
+    print(f"     País        : {df['country_final'].ne('').sum():>4} / {total}")
+    print(f"     Referências : {df['enrich_references'].ne('').sum():>4} / {total}")
+    print(f"     Prováv. ruído: {df['enrich_is_noise'].eq('sim').sum():>3} registros marcados")
+
+    src_counts = {}
+    for s in df["enrich_source"]:
+        for api in s.split(", "):
+            src_counts[api] = src_counts.get(api, 0) + 1
+    print("     Contribuição por API:")
+    for api, cnt in sorted(src_counts.items(), key=lambda x:-x[1]):
+        print(f"       {api:<20}: {cnt}")
+
+    print()
     return df
 
 
-# ══════════════════════════════════════════════════════════
 # 3. PRÉ-PROCESSAMENTO
 # ══════════════════════════════════════════════════════════
 def clean_text(text):
@@ -370,7 +741,13 @@ def plot_journals(df, out, top_n=20):
 
 # ── 4. Instituições (OpenAlex) ────────────────────────────
 def plot_institutions(df, out, top_n=20):
-    col = "openalex_institution" if "openalex_institution" in df.columns else "affiliation"
+    # Prioridade: enriquecimento cascata > openalex > original
+    if "affiliation_final" in df.columns and df["affiliation_final"].ne("").any():
+        col = "affiliation_final"
+    elif "openalex_institution" in df.columns and df["openalex_institution"].ne("").any():
+        col = "openalex_institution"
+    else:
+        col = "affiliation"
     c: Counter = Counter()
     for s in df[col]:
         for i in s.split(";"):
@@ -389,29 +766,144 @@ def plot_institutions(df, out, top_n=20):
     path = savefig(os.path.join(out, "04_instituicoes.png"))
     return path, pd.DataFrame(top, columns=["Instituição", "Publicações"])
 
-# ── 5. Países ─────────────────────────────────────────────
-def plot_countries(df, out, top_n=20):
-    c: Counter = Counter()
-    col = "openalex_country_code" if "openalex_country_code" in df.columns else "country"
-    for s in df[col]:
-        for part in re.split(r"[;,]", s):
-            code = part.strip()
-            if not code:
-                code = _guess_country(s) or ""
-            if len(code) == 2:
-                c[code.upper()] += 1
-    if not c:
-        return None, pd.DataFrame({"Nota":["Dados de países indisponíveis."]})
-    top = c.most_common(top_n)
+# ── 5. Distribuição por Estado/Região Brasileira ─────────
+# Mapeamento sigla UF → nome e região
+_UF_TO_REGION = {
+    "AC":"Norte","AL":"Nordeste","AM":"Norte","AP":"Norte","BA":"Nordeste",
+    "CE":"Nordeste","DF":"Centro-Oeste","ES":"Sudeste","GO":"Centro-Oeste",
+    "MA":"Nordeste","MG":"Sudeste","MS":"Centro-Oeste","MT":"Centro-Oeste",
+    "PA":"Norte","PB":"Nordeste","PE":"Nordeste","PI":"Nordeste",
+    "PR":"Sul","RJ":"Sudeste","RN":"Nordeste","RO":"Norte","RR":"Norte",
+    "RS":"Sul","SC":"Sul","SE":"Nordeste","SP":"Sudeste","TO":"Norte",
+}
+# Palavras-chave de afiliação → UF
+_AFF_TO_UF = {
+    "são paulo":"SP","universidade de são paulo":"SP","usp":"SP",
+    "unicamp":"SP","unesp":"SP","unifesp":"SP","federal de são paulo":"SP",
+    "rio de janeiro":"RJ","ufrj":"RJ","uerj":"RJ","puc-rio":"RJ","fiocruz":"RJ",
+    "minas gerais":"MG","ufmg":"MG","puc minas":"MG",
+    "rio grande do sul":"RS","ufrgs":"RS","pucrs":"RS","unisinos":"RS",
+    "federal do rio grande do sul":"RS",
+    "santa catarina":"SC","ufsc":"SC","udesc":"SC","federal de santa catarina":"SC",
+    "paraná":"PR","ufpr":"PR","puc-pr":"PR","federal do paraná":"PR",
+    "brasília":"DF","unb":"DF","universidade de brasília":"DF",
+    "bahia":"BA","ufba":"BA","federal da bahia":"BA",
+    "pernambuco":"PE","ufpe":"PE","federal de pernambuco":"PE",
+    "ceará":"CE","ufc":"CE","federal do ceará":"CE",
+    "amazonas":"AM","ufam":"AM","federal do amazonas":"AM",
+    "pará":"PA","ufpa":"PA","federal do pará":"PA",
+    "goiás":"GO","ufg":"GO","federal de goiás":"GO",
+    "mato grosso do sul":"MS","ufms":"MS",
+    "mato grosso":"MT","ufmt":"MT",
+    "espírito santo":"ES","ufes":"ES",
+    "maranhão":"MA","ufma":"MA",
+    "piauí":"PI","ufpi":"PI",
+    "alagoas":"AL","ufal":"AL",
+    "sergipe":"SE","ufs":"SE",
+    "paraíba":"PB","ufpb":"PB",
+    "rio grande do norte":"RN","ufrn":"RN",
+    "tocantins":"TO","uft":"TO",
+    "acre":"AC","ufac":"AC",
+    "rondônia":"RO","unir":"RO",
+    "roraima":"RR","ufrr":"RR",
+    "amapá":"AP","unifap":"AP",
+    "fluminense":"RJ","federal fluminense":"RJ",
+    "federal de minas gerais":"MG",
+    "federal de santa maria":"RS","ufsm":"RS",
+    "federal de pelotas":"RS","ufpel":"RS",
+    "federal do abc":"SP","ufabc":"SP",
+    "federal de são carlos":"SP","ufscar":"SP",
+    "federal de viçosa":"MG","ufv":"MG",
+    "federal de juiz de fora":"MG","ufjf":"MG",
+    "federal de uberlândia":"MG","ufu":"MG",
+    "federal de ouro preto":"MG","ufop":"MG",
+    "federal rural":"RJ",
+    "estadual paulista":"SP",
+    "estadual de campinas":"SP",
+    "estadual do rio de janeiro":"RJ",
+    "estadual do ceará":"CE","uece":"CE",
+    "estadual de feira de santana":"BA","uefs":"BA",
+    "estadual de londrina":"PR","uel":"PR",
+    "estadual de maringá":"PR","uem":"PR",
+}
+
+def _extract_uf(affiliation_str: str) -> str:
+    """Extrai a UF de uma string de afiliação."""
+    aff = affiliation_str.lower()
+    for keyword, uf in _AFF_TO_UF.items():
+        if keyword in aff:
+            return uf
+    return ""
+
+def plot_states_br(df, out, top_n=27):
+    """
+    Distribuição de publicações por estado e região brasileira.
+    Usa afiliação enriquecida; filtra apenas registros BR.
+    """
+    # coluna de afiliação — prioridade ao enriquecimento
+    aff_col = ("affiliation_final" if "affiliation_final" in df.columns
+               and df["affiliation_final"].ne("").any()
+               else "openalex_institution" if "openalex_institution" in df.columns
+               else "affiliation")
+
+    state_counter: Counter = Counter()
+    for _, row in df.iterrows():
+        aff = str(row.get(aff_col, "") or "")
+        if not aff:
+            continue
+        # cada afiliação pode ter várias instituições separadas por ";"
+        for part in aff.split(";"):
+            uf = _extract_uf(part.strip())
+            if uf:
+                state_counter[uf] += 1
+                break   # conta uma vez por artigo
+
+    if not state_counter:
+        return None, None, pd.DataFrame({"Nota":["Afiliações insuficientes para mapa estadual."]})
+
+    # ── gráfico por UF ────────────────────────────────────
+    top = state_counter.most_common(top_n)
     labels, vals = zip(*top)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    bars = ax.barh(labels[::-1], vals[::-1],
-                   color=plt.cm.Set2(np.linspace(0, 1, len(labels))))
-    ax.set(xlabel="Publicações", title=f"Top {top_n} Países")
+    region_colors = {
+        "Sudeste":"#1F4E79","Sul":"#2E75B6","Nordeste":"#F4A261",
+        "Centro-Oeste":"#2A9D8F","Norte":"#E76F51",
+    }
+    bar_colors = [region_colors.get(_UF_TO_REGION.get(uf,""), "#AAAAAA")
+                  for uf in labels]
+
+    fig, ax = plt.subplots(figsize=(10, max(6, len(labels)*0.45)))
+    bars = ax.barh(labels[::-1], vals[::-1], color=bar_colors[::-1])
+    ax.set(xlabel="Publicações", title="Distribuição por Estado Brasileiro")
     ax.bar_label(bars, padding=3)
+
+    # legenda de regiões
+    handles = [mpatches.Patch(color=c, label=r) for r,c in region_colors.items()]
+    ax.legend(handles=handles, title="Região", loc="lower right", fontsize=8)
     plt.tight_layout()
-    path = savefig(os.path.join(out, "05_paises.png"))
-    return path, pd.DataFrame(top, columns=["País (ISO2)", "Publicações"])
+    path_uf = savefig(os.path.join(out, "05_estados_br.png"))
+
+    # ── gráfico por Região ────────────────────────────────
+    reg_counter: Counter = Counter()
+    for uf, cnt in state_counter.items():
+        reg = _UF_TO_REGION.get(uf, "Desconhecido")
+        reg_counter[reg] += cnt
+
+    reg_top = reg_counter.most_common()
+    rlabels, rvals = zip(*reg_top)
+    fig2, ax2 = plt.subplots(figsize=(8, 5))
+    wedge_colors = [region_colors.get(r,"#AAAAAA") for r in rlabels]
+    ax2.pie(rvals, labels=rlabels, colors=wedge_colors,
+            autopct="%1.1f%%", startangle=140,
+            textprops={"fontsize": 11})
+    ax2.set_title("Distribuição por Região Brasileira", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    path_reg = savefig(os.path.join(out, "05b_regioes_br.png"))
+
+    df_out = pd.DataFrame([
+        {"UF": uf, "Região": _UF_TO_REGION.get(uf,""), "Publicações": cnt}
+        for uf, cnt in state_counter.most_common()
+    ])
+    return path_uf, path_reg, df_out
 
 # ── 6. Rede de coautoria ──────────────────────────────────
 def plot_coauthorship(df, out, min_deg=1):
@@ -497,7 +989,7 @@ def plot_coupling(df, out):
 # ── 9. Palavras-chave ─────────────────────────────────────
 def plot_keywords(df, out, top_n=30):
     c: Counter = Counter()
-    for s in df["keywords"]:
+    for s in df.get("keywords_final", df["keywords"]):
         for kw in parse_keywords(s):
             if len(kw) >= 3: c[kw] += 1
     if not c:
@@ -534,7 +1026,7 @@ def plot_keywords(df, out, top_n=30):
 def plot_cooccurrence(df, out, top_terms=40, min_cooc=2):
     docs = []
     for _, row in df.iterrows():
-        toks = tokenize(row["title"] + " " + row.get("abstract",""))
+        toks = tokenize(row["title"] + " " + row.get("abstract_final", row.get("abstract","")))
         if toks: docs.append(toks)
 
     freq: Counter = Counter(t for d in docs for t in d)
@@ -573,7 +1065,7 @@ def run_lda(df, out, n_topics=5):
     from sklearn.feature_extraction.text import CountVectorizer
     from sklearn.decomposition import LatentDirichletAllocation
 
-    corpus = [" ".join(tokenize(r["title"]+" "+r.get("abstract","")+" "+r["keywords"]))
+    corpus = [" ".join(tokenize(r["title"]+" "+r.get("abstract_final",r.get("abstract",""))+" "+r.get("keywords_final",r.get("keywords",""))))
               for _, r in df.iterrows()]
     n_topics = max(2, min(n_topics, len(corpus)//2))
 
@@ -614,7 +1106,7 @@ def run_nmf(df, out, n_topics=5):
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.decomposition import NMF
 
-    corpus = [" ".join(tokenize(r["title"]+" "+r.get("abstract","")+" "+r["keywords"]))
+    corpus = [" ".join(tokenize(r["title"]+" "+r.get("abstract_final",r.get("abstract",""))+" "+r.get("keywords_final",r.get("keywords",""))))
               for _, r in df.iterrows()]
     corpus = [d for d in corpus if len(d.split()) >= 2]
 
@@ -710,7 +1202,7 @@ def plot_trends(df, out, doc_topics=None, n_topics=5):
 
     # fallback: keywords por ano
     kw_c: Counter = Counter()
-    for s in df["keywords"]:
+    for s in df.get("keywords_final", df["keywords"]):
         for kw in parse_keywords(s): kw_c[kw] += 1
     if not kw_c:
         for t in df["title"]:
@@ -739,30 +1231,273 @@ def plot_trends(df, out, doc_topics=None, n_topics=5):
         **{t:[kw_by_yr.get(y,Counter()).get(t,0) for y in years] for t in top10}})
     return path, trend_df
 
-# ── 14. Mapa colaboração ──────────────────────────────────
-def plot_map(df, out):
-    c: Counter = Counter()
-    col = "openalex_country_code" if "openalex_country_code" in df.columns else "country"
-    for s in df[col]:
-        for part in re.split(r"[;,]", s):
-            code = part.strip().upper()
-            if len(code)==2: c[code] += 1
-    if not c:
-        return None, pd.DataFrame({"Nota":["Dados de países indisponíveis."]})
+# ── Filtro de idioma ──────────────────────────────────────
+# Indicadores de que o título está em português
+_PT_MARKERS = [
+    "ção","ões","ção","ões","ão","ões","ão","ões",
+    " do "," da "," de "," das "," dos "," em "," com "," para ",
+    " por "," que "," não "," uma "," um "," os "," as ",
+    "ismo","ista","ção","eiro","eira","mente",
+]
+_EN_MARKERS = [
+    " the "," of "," and "," in "," for "," to "," a "," an ",
+    " with "," on "," at "," by "," from "," or "," is "," are ",
+]
 
-    country_df = pd.DataFrame(c.most_common(), columns=["iso_alpha2","count"])
-    try:
-        import plotly.express as px
-        fig = px.choropleth(country_df, locations="iso_alpha2",
-                            locationmode="ISO-3166-1-alpha-2", color="count",
-                            color_continuous_scale="Blues",
-                            title="Mapa de Colaboração Internacional",
-                            labels={"count":"Publicações"})
-        fig.write_html(os.path.join(out, "14_mapa_colaboracao.html"))
-        print("    → Mapa interativo salvo como HTML")
-    except Exception as e:
-        print(f"    (plotly indisponível: {e})")
-    return None, country_df
+def _detect_lang(title: str) -> str:
+    """Retorna 'pt', 'en', ou 'und' (undetermined)."""
+    t = " " + title.lower() + " "
+    pt_hits = sum(1 for m in _PT_MARKERS if m in t)
+    en_hits = sum(1 for m in _EN_MARKERS if m in t)
+    if pt_hits >= 2 and pt_hits > en_hits:
+        return "pt"
+    if en_hits >= 3 and en_hits > pt_hits:
+        return "en"
+    return "und"
+
+def filter_by_language(df: pd.DataFrame, keep_lang: str = "pt") -> tuple:
+    """
+    Retorna (df_kept, df_removed).
+    Tenta campo 'language' do BibTeX primeiro; fallback para detecção por título.
+    """
+    lang_series = []
+    for _, row in df.iterrows():
+        lang_raw = str(row.get("language","") or "").strip().lower()
+        if lang_raw in ("pt","por","português","portuguese"):
+            lang_series.append("pt")
+        elif lang_raw in ("en","eng","english","inglês"):
+            lang_series.append("en")
+        elif lang_raw in ("es","spa","español","espanhol","spanish"):
+            lang_series.append("es")
+        elif lang_raw:
+            lang_series.append(lang_raw[:2])
+        else:
+            lang_series.append(_detect_lang(str(row.get("title","") or "")))
+
+    df = df.copy()
+    df["_lang_detected"] = lang_series
+    mask = df["_lang_detected"].isin([keep_lang, "und"])
+    df_kept    = df[mask].copy()
+    df_removed = df[~mask].copy()
+    return df_kept, df_removed
+
+# ── Qualis CAPES ──────────────────────────────────────────
+# Base Qualis embutida: ISSNs mais comuns na produção brasileira
+# sobre Ciências Sociais / Humanidades (atualizar conforme sua área)
+# Fonte: Sucupira 2017-2020 (última avaliação quadrienal publicada)
+_QUALIS_DB = {
+    # ISSN: (Estrato, Área de referência)
+    "1981-9951": ("A1","Ciências Sociais"),         # Lua Nova
+    "0102-6992": ("A1","Sociologia"),                # Sociedade e Estado
+    "0104-7183": ("A1","Antropologia"),              # Mana
+    "1517-4522": ("A2","Ciências Sociais"),          # Sociologias
+    "0104-7191": ("A2","Ciências Sociais"),          # Horizontes Antropológicos
+    "1678-4669": ("A2","Ciências Sociais"),          # RBCS — Rev. Bras. de Ciências Sociais
+    "0034-7701": ("A2","Sociologia"),                # RBCS (alt ISSN)
+    "1981-9870": ("A2","Relações Internacionais"),   # Contexto Internacional
+    "2176-9036": ("A3","Antropologia"),              # Anuário Antropológico
+    "0103-4014": ("A1","Ciências Sociais"),          # Estudos Avançados
+    "1806-9592": ("A3","História"),                  # História (São Paulo)
+    "0101-4161": ("A3","Letras"),                    # Anos 90
+    "1519-5694": ("B1","Comunicação"),               # Lumina
+    "2238-7714": ("B2","Comunicação"),               # Significação
+    "2176-8064": ("B3","Ciências Sociais"),          # Malala
+    "1519-7794": ("B2","Direito"),                   # Espaço Jurídico
+    "2317-2460": ("B3","Ciências Sociais"),          # Cadernos de Campo
+    "2317-9163": ("B2","Ciências Sociais"),          # Diversitates
+    "1984-9605": ("B3","Relações Internacionais"),   # Tensões Mundiais
+    "2177-7837": ("B3","Relações Internacionais"),   # Carta Internacional
+    "2316-9346": ("B3","Ciências Sociais"),          # Verso e Reverso
+    "2359-5949": ("B3","Comunicação"),               # Esferas
+    "1516-4136": ("B4","Educação"),                  # Educação e Pesquisa
+    "0034-7140": ("A2","Antropologia"),              # Revista de Antropologia
+    "1519-5694": ("B1","Comunicação"),               # Rebeca
+    "2237-101X": ("B3","Letras"),                    # Arquivo Maaravi
+    "1678-4359": ("B3","Ciências Sociais"),          # Fronteiras
+    "0104-8015": ("B3","Direito"),                   # Rev. de Estudios Sociales
+    "0104-1169": ("A2","Saúde"),                     # História Ciências Saúde-Manguinhos
+    "2175-3369": ("B4","Ciências Sociais"),          # Verso e Reverso
+    "2318-1982": ("B3","Ciências Sociais"),          # Revista de Ciências do Estado
+}
+
+# Nomes de periódicos → Qualis (fallback quando ISSN não disponível)
+_JOURNAL_QUALIS = {
+    "horizontes antropológicos":       ("A2","Antropologia"),
+    "mana":                            ("A1","Antropologia"),
+    "estudos avançados":               ("A1","Ciências Sociais"),
+    "revista brasileira de ciências sociais": ("A1","Sociologia"),
+    "história (são paulo)":            ("A3","História"),
+    "história ciências saúde-manguinhos": ("A2","Saúde"),
+    "cadernos de campo (são paulo 1991)": ("B3","Ciências Sociais"),
+    "malala":                          ("B3","Ciências Sociais"),
+    "diversitates international journal": ("B2","Ciências Sociais"),
+    "tensões mundiais":                ("B3","Relações Internacionais"),
+    "carta internacional":             ("B3","Relações Internacionais"),
+    "espaço jurídico journal of law [ejjl]": ("B2","Direito"),
+    "educação e pesquisa":             ("B4","Educação"),
+    "revista de antropologia":         ("A2","Antropologia"),
+    "anos 90":                         ("A3","História"),
+    "arquivo maaravi revista digital de estudos judaicos da ufmg": ("B3","Letras"),
+    "lumina":                          ("B1","Comunicação"),
+    "significação revista de cultura audiovisual": ("B2","Comunicação"),
+    "esferas":                         ("B3","Comunicação"),
+    "novos estudos - cebrap":          ("A1","Ciências Sociais"),
+    "anuário antropológico":           ("A3","Antropologia"),
+    "conjuntura austral":              ("B2","Relações Internacionais"),
+    "verso e reverso":                 ("B3","Comunicação"),
+    "sociedade e estado":              ("A1","Sociologia"),
+    "sociologias":                     ("A2","Ciências Sociais"),
+    "lua nova":                        ("A1","Ciências Sociais"),
+    "contexto internacional":          ("A2","Relações Internacionais"),
+    "revista brasileira de história da mídia": ("B2","Comunicação"),
+    "rebeca - revista brasileira de estudos de cinema e audiovisual": ("B1","Comunicação"),
+    "revista de ciências do estado":   ("B3","Ciências Sociais"),
+    "fronteiras revista catarinense de história": ("B3","História"),
+    "letrônica":                       ("B2","Letras"),
+}
+
+_QUALIS_ORDER = {"A1":1,"A2":2,"A3":3,"A4":4,"B1":5,"B2":6,"B3":7,"B4":8,"C":9,"":10}
+
+def _lookup_qualis(journal: str, issn: str = "") -> tuple:
+    """Retorna (estrato, área) para um periódico."""
+    # 1) por ISSN
+    issn_clean = re.sub(r"[^0-9X]", "", (issn or "").upper())
+    for i in range(0, len(issn_clean)-3, 4):
+        key = issn_clean[:4] + "-" + issn_clean[4:8]
+        if key in _QUALIS_DB:
+            return _QUALIS_DB[key]
+
+    # 2) por nome normalizado
+    j_norm = journal.lower().strip()
+    if j_norm in _JOURNAL_QUALIS:
+        return _JOURNAL_QUALIS[j_norm]
+
+    # 3) busca parcial
+    for name, val in _JOURNAL_QUALIS.items():
+        if name in j_norm or j_norm in name:
+            return val
+
+    return ("", "Não classificado")
+
+def plot_qualis(df, out):
+    """
+    Analisa os periódicos por Qualis CAPES:
+    - Distribuição de artigos por estrato (A1→C)
+    - Ranking de periódicos com estrato
+    - Gráfico de pizza por estrato
+    """
+    print("  → Análise Qualis CAPES")
+
+    rows = []
+    for _, row in df.iterrows():
+        j    = str(row.get("journal","") or "").strip()
+        issn = str(row.get("issn","") or row.get("number","") or "")
+        estrato, area = _lookup_qualis(j, issn)
+        rows.append({"Periódico": j, "Estrato": estrato,
+                     "Área": area, "Ano": row.get("year_int","")})
+
+    df_q = pd.DataFrame(rows)
+
+    # ── Distribuição por estrato ──────────────────────────
+    strata_count = df_q.groupby("Estrato").size().reset_index(name="Artigos")
+    strata_count["Ordem"] = strata_count["Estrato"].map(
+        lambda x: _QUALIS_ORDER.get(x, 10))
+    strata_count = strata_count.sort_values("Ordem")
+
+    STRATA_COLORS = {
+        "A1":"#1a237e","A2":"#1565C0","A3":"#1E88E5","A4":"#64B5F6",
+        "B1":"#2E7D32","B2":"#43A047","B3":"#A5D6A7","B4":"#C8E6C9",
+        "C":"#F44336","":"#BDBDBD",
+    }
+    colors = [STRATA_COLORS.get(e,"#BDBDBD") for e in strata_count["Estrato"]]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # barras
+    ax = axes[0]
+    bars = ax.bar(strata_count["Estrato"], strata_count["Artigos"],
+                  color=colors, edgecolor="white")
+    ax.set(xlabel="Estrato Qualis", ylabel="Artigos",
+           title="Distribuição por Estrato Qualis CAPES")
+    ax.bar_label(bars, padding=3)
+    ax.grid(axis="y", alpha=0.3)
+
+    # pizza
+    ax2 = axes[1]
+    classified = strata_count[strata_count["Estrato"] != ""]
+    if not classified.empty:
+        ax2.pie(classified["Artigos"], labels=classified["Estrato"],
+                colors=[STRATA_COLORS.get(e,"#BDBDBD") for e in classified["Estrato"]],
+                autopct="%1.1f%%", startangle=140, textprops={"fontsize":10})
+        ax2.set_title("Proporção por Estrato\n(excl. não classificados)", fontsize=12)
+    else:
+        ax2.text(0.5, 0.5, "Sem dados classificados", ha="center", va="center")
+
+    plt.tight_layout()
+    path_dist = savefig(os.path.join(out, "14_qualis_distribuicao.png"))
+
+    # ── Ranking periódicos com Qualis ─────────────────────
+    journal_q = (df_q.groupby(["Periódico","Estrato","Área"])
+                 .size().reset_index(name="Artigos")
+                 .sort_values(["Ordem" if "Ordem" in df_q.columns else "Artigos"],
+                              ascending=True))
+    # add ordem para sort
+    journal_q["Ordem"] = journal_q["Estrato"].map(lambda x: _QUALIS_ORDER.get(x,10))
+    journal_q = journal_q.sort_values(["Ordem","Artigos"], ascending=[True,False])
+    top30 = journal_q.head(30)
+
+    if not top30.empty:
+        bar_cols = [STRATA_COLORS.get(e,"#BDBDBD") for e in top30["Estrato"]]
+        fig2, ax3 = plt.subplots(figsize=(12, max(6, len(top30)*0.45)))
+        labels_j = [f'{r["Periódico"][:45]} [{r["Estrato"]}]'
+                    for _, r in top30.iterrows()]
+        bars2 = ax3.barh(labels_j[::-1], top30["Artigos"].values[::-1],
+                         color=bar_cols[::-1])
+        ax3.set(xlabel="Artigos", title="Periódicos por Qualis CAPES (Top 30)")
+        ax3.bar_label(bars2, padding=3)
+
+        # legenda de estratos
+        seen = {}
+        for e, c in STRATA_COLORS.items():
+            if e and e not in seen and e in top30["Estrato"].values:
+                seen[e] = mpatches.Patch(color=c, label=e)
+        ax3.legend(handles=list(seen.values()), title="Estrato",
+                   loc="lower right", fontsize=8)
+        plt.tight_layout()
+        path_rank = savefig(os.path.join(out, "14b_qualis_periodicos.png"))
+    else:
+        path_rank = None
+
+    # evolução temporal por estrato
+    df_q_yr = df_q[df_q["Estrato"] != ""].copy()
+    if not df_q_yr.empty and "Ano" in df_q_yr.columns:
+        pivot = (df_q_yr.groupby(["Ano","Estrato"])
+                 .size().reset_index(name="n")
+                 .pivot(index="Ano", columns="Estrato", values="n")
+                 .fillna(0))
+        ordered_cols = [c for c in ["A1","A2","A3","A4","B1","B2","B3","B4","C"]
+                        if c in pivot.columns]
+        pivot = pivot[ordered_cols]
+
+        fig3, ax4 = plt.subplots(figsize=(13, 5))
+        bottom = np.zeros(len(pivot))
+        years  = pivot.index.astype(str)
+        for col in ordered_cols:
+            color = STRATA_COLORS.get(col,"#BDBDBD")
+            ax4.bar(years, pivot[col].values, bottom=bottom,
+                    label=col, color=color)
+            bottom += pivot[col].values
+        ax4.set(xlabel="Ano", ylabel="Artigos",
+                title="Evolução Temporal por Estrato Qualis")
+        ax4.legend(title="Estrato", bbox_to_anchor=(1.01,1), loc="upper left")
+        ax4.tick_params(axis="x", rotation=45)
+        plt.tight_layout()
+        path_evol = savefig(os.path.join(out, "14c_qualis_evolucao.png"))
+    else:
+        path_evol = None
+
+    df_out = journal_q[["Periódico","Estrato","Área","Artigos"]].copy()
+    return path_dist, path_rank, path_evol, df_out, strata_count
 
 
 # ══════════════════════════════════════════════════════════
@@ -873,12 +1608,15 @@ def main():
 
     # ── Pergunta sobre enriquecimento ──────────────────────
     print("\n──────────────────────────────────────────────")
-    ans = input("Enriquecer com OpenAlex via DOI? (s/n) [s]: ").strip().lower()
+    ans = input("Enriquecer metadados via APIs? (s/n) [s]: ").strip().lower()
     if ans in ("", "s", "sim", "y", "yes"):
-        email = input(f"  E-mail para polite pool [{OPENALEX_EMAIL}]: ").strip()
+        email = input(f"  Seu e-mail (polite pool) [{OPENALEX_EMAIL}]: ").strip()
         if not email:
             email = OPENALEX_EMAIL
-        df = enrich_with_openalex(df, email)
+        print("  Chave Semantic Scholar (opcional — Enter para pular):")
+        print("  Obtenha grátis em: https://www.semanticscholar.org/product/api")
+        s2_key = input("  Chave S2: ").strip()
+        df = enrich_cascade(df, email, s2_key)
     print("──────────────────────────────────────────────\n")
 
     print("Gerando análises…\n")
@@ -902,10 +1640,11 @@ def main():
     p, d = plot_institutions(df, out)
     results["4. Instituições"] = (p, d)
 
-    # 5. Países
-    print("  → Países mais produtivos")
-    p, d = plot_countries(df, out)
-    results["5. Países"] = (p, d)
+    # 5. Distribuição regional brasileira
+    print("  → Distribuição por estado/região brasileira")
+    p_uf, p_reg, d_states = plot_states_br(df, out)
+    results["5a. Estados BR"]  = (p_uf,  d_states)
+    results["5b. Regiões BR"]  = (p_reg, None)
 
     # 6. Rede coautoria
     print("  → Rede de coautoria")
@@ -950,10 +1689,32 @@ def main():
     p, d = plot_trends(df, out, doc_topics, n_t)
     results["13. Tendências"] = (p, d)
 
-    # 14. Mapa
-    print("  → Mapa de colaboração internacional")
-    p, d = plot_map(df, out)
-    results["14. Mapa"] = (p, d)
+    # Filtro de idioma (português)
+    df_pt, df_removed = filter_by_language(df, keep_lang="pt")
+    n_removed = len(df_removed)
+    if n_removed > 0:
+        print(f"  → Filtro de idioma: {n_removed} registro(s) removido(s) "
+              f"(não português) — restam {len(df_pt)}")
+        results["0b. Removidos Idioma"] = (None, df_removed[
+            ["title","journal","year","_lang_detected"]
+        ].rename(columns={"title":"Título","journal":"Periódico",
+                          "year":"Ano","_lang_detected":"Idioma Detectado"}))
+        df = df_pt   # usa base filtrada daqui em frente para análises seguintes
+
+    # Aba de auditoria de ruído (se enriquecimento foi feito)
+    if "enrich_is_noise" in df.columns:
+        noise_df = df[df["enrich_is_noise"] == "sim"][
+            ["title","journal","year","enrich_doc_type","enrich_source"]
+        ].rename(columns={"title":"Título","journal":"Periódico",
+                          "year":"Ano","enrich_doc_type":"Tipo","enrich_source":"APIs"})
+        results["0. Ruídos Detectados"] = (None, noise_df)
+
+    # 14. Qualis CAPES
+    print("  → Análise Qualis CAPES")
+    p_qdist, p_qrank, p_qevol, d_qualis, d_strata = plot_qualis(df, out)
+    results["14a. Qualis Distribuição"] = (p_qdist, d_strata)
+    results["14b. Qualis Periódicos"]   = (p_qrank, d_qualis)
+    results["14c. Qualis Evolução"]     = (p_qevol, None)
 
     # ── Exportar XLSX ──────────────────────────────────────
     print()
