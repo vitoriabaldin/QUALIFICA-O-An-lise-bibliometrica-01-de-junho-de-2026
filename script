@@ -1,0 +1,957 @@
+"""
+=============================================================
+  ANÁLISE BIBLIOMÉTRICA COMPLETA — PORTAL CAPES
+  v2.0  |  Saída: XLSX + PNGs
+=============================================================
+FUNCIONALIDADES
+  1.  Evolução temporal das publicações
+  2.  Principais autores
+  3.  Principais periódicos
+  4.  Instituições mais produtivas   ← enriquecido via OpenAlex
+  5.  Países mais produtivos         ← enriquecido via OpenAlex
+  6.  Rede de coautoria
+  7.  Rede de cocitação
+  8.  Acoplamento bibliográfico
+  9.  Análise de palavras-chave
+  10. Coocorrência de termos
+  11. Modelagem de tópicos — LDA
+  12. Modelagem de tópicos — BERTopic ← novo
+  13. Tendências temáticas ao longo do tempo
+  14. Mapa de colaboração internacional
+
+SAÍDAS
+  resultados/relatorio_bibliometrico.xlsx  ← planilha com abas por análise
+  resultados/*.png                         ← gráficos individuais
+
+COMO USAR
+  1. Coloque os arquivos .bib na mesma pasta do script,
+     nomeados: "Periodicos-CAPES-BibTex (1).bib" … "(6).bib"
+  2. python analise_bibliometrica.py
+     # ou passando a pasta:
+     python analise_bibliometrica.py "C:\\Users\\viihb\\Downloads"
+
+DEPENDÊNCIAS
+  pip install bibtexparser networkx matplotlib seaborn pandas numpy
+              scikit-learn pyLDAvis --no-deps
+  pip install funcy numexpr
+  pip install wordcloud plotly pycountry bertopic sentence-transformers
+              umap-learn hdbscan openpyxl requests tqdm
+=============================================================
+"""
+
+# ── stdlib ────────────────────────────────────────────────
+import os, re, sys, time, glob, warnings
+from pathlib import Path
+from collections import Counter, defaultdict
+from itertools import combinations
+
+# ── third-party ───────────────────────────────────────────
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+import networkx as nx
+from wordcloud import WordCloud
+
+import bibtexparser
+from bibtexparser.bparser import BibTexParser
+from bibtexparser.customization import convert_to_unicode
+
+import requests
+from tqdm import tqdm
+
+from openpyxl import Workbook
+from openpyxl.styles import (Font, PatternFill, Alignment,
+                              Border, Side, GradientFill)
+from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image as XLImage
+
+warnings.filterwarnings("ignore")
+
+# ══════════════════════════════════════════════════════════
+# CONFIGURAÇÕES
+# ══════════════════════════════════════════════════════════
+BIB_PATTERN = "Periodicos-CAPES-BibTex ({n}).bib"
+MAX_FILES   = 6
+OUTPUT_DIR  = "resultados"
+DPI         = 150
+OPENALEX_EMAIL = "seuemail@exemplo.com"   # ← coloque seu e-mail p/ polite pool
+
+STOPWORDS = {
+    "de","da","do","das","dos","em","no","na","nos","nas","e","é","o","a",
+    "os","as","um","uma","uns","umas","para","por","com","sem","sobre",
+    "entre","se","que","ao","à","aos","às","ou","mas","não","mais",
+    "the","of","in","and","to","a","an","is","are","was","were","for",
+    "on","with","as","at","by","from","or","its","it","be","been",
+    "being","have","has","had","this","that","these","those","not","but",
+    "their","between","also","can","which","into","through","after",
+    "quot","amp","lt","gt",
+}
+
+COUNTRY_ALIASES = {
+    "usa":"US","united states":"US","u.s.a.":"US","u.s.":"US",
+    "uk":"GB","united kingdom":"GB","england":"GB",
+    "brasil":"BR","brazil":"BR","alemanha":"DE","germany":"DE",
+    "franca":"FR","france":"FR","espanha":"ES","spain":"ES",
+    "argentina":"AR","mexico":"MX","chile":"CL","china":"CN",
+    "japan":"JP","india":"IN","australia":"AU","canada":"CA",
+    "portugal":"PT","italia":"IT","italy":"IT","colombia":"CO",
+    "peru":"PE","venezuela":"VE","uruguay":"UY","bolivia":"BO",
+    "south africa":"ZA","netherlands":"NL","belgium":"BE",
+    "sweden":"SE","norway":"NO","denmark":"DK","finland":"FI",
+    "switzerland":"CH","austria":"AT","poland":"PL","russia":"RU",
+    "turkey":"TR","israel":"IL","south korea":"KR","taiwan":"TW",
+}
+
+# ── Excel style helpers ───────────────────────────────────
+HEADER_FILL   = PatternFill("solid", fgColor="1F4E79")
+SUBHEAD_FILL  = PatternFill("solid", fgColor="2E75B6")
+ALT_FILL      = PatternFill("solid", fgColor="D6E4F7")
+HEADER_FONT   = Font(bold=True, color="FFFFFF", name="Arial", size=11)
+BODY_FONT     = Font(name="Arial", size=10)
+CENTER        = Alignment(horizontal="center", vertical="center", wrap_text=True)
+LEFT          = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+THIN          = Side(style="thin", color="BFBFBF")
+BORDER        = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+def style_header(cell, fill=HEADER_FILL):
+    cell.font      = HEADER_FONT
+    cell.fill      = fill
+    cell.alignment = CENTER
+    cell.border    = BORDER
+
+def style_body(cell, alt=False):
+    cell.font      = BODY_FONT
+    cell.fill      = ALT_FILL if alt else PatternFill("solid", fgColor="FFFFFF")
+    cell.alignment = LEFT
+    cell.border    = BORDER
+
+def auto_width(ws, min_w=10, max_w=60):
+    for col in ws.columns:
+        best = min_w
+        for cell in col:
+            try:
+                best = max(best, len(str(cell.value or "")))
+            except Exception:
+                pass
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(best + 2, max_w)
+
+def write_df_to_sheet(ws, df: pd.DataFrame, title: str = ""):
+    """Write DataFrame to sheet with styled header."""
+    if title:
+        ws.append([title])
+        ws.merge_cells(start_row=ws.max_row, start_column=1,
+                       end_row=ws.max_row, end_column=len(df.columns))
+        title_cell = ws.cell(ws.max_row, 1)
+        title_cell.font      = Font(bold=True, name="Arial", size=13, color="1F4E79")
+        title_cell.alignment = CENTER
+        ws.row_dimensions[ws.max_row].height = 22
+        ws.append([])  # blank row
+
+    # Header
+    ws.append(list(df.columns))
+    for cell in ws[ws.max_row]:
+        style_header(cell)
+    ws.row_dimensions[ws.max_row].height = 18
+
+    # Data rows
+    for i, row in df.iterrows():
+        ws.append(list(row))
+        for cell in ws[ws.max_row]:
+            style_body(cell, alt=(i % 2 == 1))
+        ws.row_dimensions[ws.max_row].height = 15
+
+    auto_width(ws)
+
+
+# ══════════════════════════════════════════════════════════
+# 1. CARREGAMENTO DOS ARQUIVOS BIB
+# ══════════════════════════════════════════════════════════
+def find_bib_files(pattern, max_n, base_dir="."):
+    found = []
+    for n in range(1, max_n + 1):
+        p = os.path.join(base_dir, pattern.replace("{n}", str(n)))
+        if os.path.exists(p):
+            found.append(p)
+    if not found:
+        found = glob.glob(os.path.join(base_dir, "*.bib"))
+    return found
+
+
+def load_bib_files(paths):
+    parser = BibTexParser(common_strings=True)
+    parser.customization = convert_to_unicode
+    all_entries = []
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                db = bibtexparser.load(f, parser=parser)
+            all_entries.extend(db.entries)
+            print(f"  ✓ {os.path.basename(path)} → {len(db.entries)} registros")
+        except Exception as exc:
+            print(f"  ✗ Erro em {os.path.basename(path)}: {exc}")
+
+    if not all_entries:
+        sys.exit("Nenhuma entrada encontrada. Verifique os arquivos .bib.")
+
+    df = pd.DataFrame(all_entries)
+    for col in ["author","title","journal","year","keywords",
+                "abstract","doi","affiliation","country","volume","number","pages"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+
+    before = len(df)
+    df["doi_clean"] = df["doi"].str.lower().str.strip()
+    df = df[~((df["doi_clean"] != "") & df["doi_clean"].duplicated(keep="first"))]
+    df = df.drop(columns=["doi_clean"])
+    print(f"\n  Total: {before} → deduplicado: {len(df)} registros\n")
+
+    df["year_int"] = pd.to_numeric(df["year"], errors="coerce")
+    df = df[df["year_int"].notna()].copy()
+    df["year_int"] = df["year_int"].astype(int)
+    return df.reset_index(drop=True)
+
+
+# ══════════════════════════════════════════════════════════
+# 2. ENRIQUECIMENTO VIA OPENALEX
+# ══════════════════════════════════════════════════════════
+def _openalex_fetch(doi: str, email: str):
+    doi_clean = doi.strip().lower()
+    if not doi_clean:
+        return None
+    url = f"https://api.openalex.org/works/doi:{doi_clean}"
+    try:
+        r = requests.get(url, params={"mailto": email}, timeout=12)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def enrich_with_openalex(df: pd.DataFrame, email: str) -> pd.DataFrame:
+    """
+    Para cada DOI consulta a API OpenAlex e extrai:
+      - institution_name, institution_country, country_code, ror
+    Aguarda 0.2 s entre requisições (polite pool).
+    """
+    print("  → Enriquecendo via OpenAlex (pode demorar alguns minutos)…")
+    inst_names, inst_countries, country_codes = [], [], []
+
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="  OpenAlex"):
+        data = _openalex_fetch(row["doi"], email)
+        if data is None:
+            inst_names.append("")
+            inst_countries.append("")
+            country_codes.append("")
+            time.sleep(0.2)
+            continue
+
+        auths = data.get("authorships", [])
+        insts, ctries, codes = [], [], []
+        for auth in auths:
+            for inst in auth.get("institutions", []):
+                n = inst.get("display_name", "")
+                c = inst.get("country_code", "")
+                if n:
+                    insts.append(n)
+                if c:
+                    codes.append(c)
+                    # reverse lookup pycountry for full name
+                    try:
+                        import pycountry
+                        country_obj = pycountry.countries.get(alpha_2=c)
+                        if country_obj:
+                            ctries.append(country_obj.name)
+                        else:
+                            ctries.append(c)
+                    except Exception:
+                        ctries.append(c)
+
+        inst_names.append("; ".join(dict.fromkeys(insts)))
+        inst_countries.append("; ".join(dict.fromkeys(ctries)))
+        country_codes.append("; ".join(dict.fromkeys(codes)))
+        time.sleep(0.2)
+
+    df = df.copy()
+    df["openalex_institution"] = inst_names
+    df["openalex_country"]     = inst_countries
+    df["openalex_country_code"] = country_codes
+    print("  ✓ Enriquecimento concluído\n")
+    return df
+
+
+# ══════════════════════════════════════════════════════════
+# 3. PRÉ-PROCESSAMENTO
+# ══════════════════════════════════════════════════════════
+def clean_text(text):
+    text = re.sub(r"\{[^{}]*\}", " ", text)
+    text = re.sub(r"\\[a-zA-Z]+", " ", text)
+    text = re.sub(r"[^\w\sáéíóúâêîôûãõàèìòùäëïöüçñ-]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+def tokenize(text, min_len=3):
+    return [w for w in clean_text(text).split()
+            if len(w) >= min_len and w not in STOPWORDS]
+
+def parse_authors(s):
+    if not s: return []
+    parts = re.split(r"\s+and\s+", s, flags=re.IGNORECASE)
+    if len(parts) == 1:
+        parts = [p.strip() for p in s.split(";") if p.strip()]
+    return [p.strip() for p in parts if p.strip()]
+
+def parse_keywords(s):
+    if not s: return []
+    sep = ";" if ";" in s else ","
+    return [k.strip().lower() for k in s.split(sep) if k.strip()]
+
+def _guess_country(text):
+    t = text.lower()
+    for alias, code in COUNTRY_ALIASES.items():
+        if alias in t:
+            return code
+    return None
+
+
+# ══════════════════════════════════════════════════════════
+# FUNÇÕES DE GRÁFICO
+# ══════════════════════════════════════════════════════════
+def savefig(path):
+    plt.savefig(path, dpi=DPI, bbox_inches="tight")
+    plt.close()
+    return path
+
+# ── 1. Evolução temporal ──────────────────────────────────
+def plot_temporal(df, out):
+    counts = df.groupby("year_int").size().sort_index()
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.bar(counts.index, counts.values, color="#1F4E79", edgecolor="white")
+    ax.plot(counts.index, counts.values, "o-", color="#E84855", lw=2, ms=5)
+    ax.set(xlabel="Ano", ylabel="Publicações",
+           title="Evolução Temporal das Publicações")
+    ax.grid(axis="y", alpha=0.4)
+    plt.tight_layout()
+    return savefig(os.path.join(out, "01_evolucao_temporal.png")), counts
+
+# ── 2. Autores ───────────────────────────────────────────
+def plot_authors(df, out, top_n=20):
+    c: Counter = Counter()
+    for s in df["author"]:
+        for a in parse_authors(s): c[a] += 1
+    top = c.most_common(top_n)
+    if not top: return None, pd.DataFrame()
+    labels, vals = zip(*top)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    bars = ax.barh(labels[::-1], vals[::-1],
+                   color=plt.cm.viridis(np.linspace(0.2, 0.8, len(labels))))
+    ax.set(xlabel="Publicações", title=f"Top {top_n} Autores")
+    ax.bar_label(bars, padding=3)
+    plt.tight_layout()
+    path = savefig(os.path.join(out, "02_autores.png"))
+    return path, pd.DataFrame(top, columns=["Autor", "Publicações"])
+
+# ── 3. Periódicos ─────────────────────────────────────────
+def plot_journals(df, out, top_n=20):
+    counts = df["journal"].replace("","Sem periódico").value_counts().head(top_n)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    bars = ax.barh(counts.index[::-1], counts.values[::-1],
+                   color=plt.cm.plasma(np.linspace(0.2, 0.8, len(counts))))
+    ax.set(xlabel="Artigos", title=f"Top {top_n} Periódicos")
+    ax.bar_label(bars, padding=3)
+    plt.tight_layout()
+    path = savefig(os.path.join(out, "03_periodicos.png"))
+    return path, counts.rename("Artigos").reset_index().rename(
+        columns={"index":"Periódico"})
+
+# ── 4. Instituições (OpenAlex) ────────────────────────────
+def plot_institutions(df, out, top_n=20):
+    col = "openalex_institution" if "openalex_institution" in df.columns else "affiliation"
+    c: Counter = Counter()
+    for s in df[col]:
+        for i in s.split(";"):
+            i = i.strip()
+            if i: c[i] += 1
+    if not c:
+        return None, pd.DataFrame({"Nota":["Dados de instituição indisponíveis."]})
+    top = c.most_common(top_n)
+    labels, vals = zip(*top)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    bars = ax.barh(labels[::-1], vals[::-1],
+                   color=plt.cm.coolwarm(np.linspace(0.1, 0.9, len(labels))))
+    ax.set(xlabel="Publicações", title=f"Top {top_n} Instituições")
+    ax.bar_label(bars, padding=3)
+    plt.tight_layout()
+    path = savefig(os.path.join(out, "04_instituicoes.png"))
+    return path, pd.DataFrame(top, columns=["Instituição", "Publicações"])
+
+# ── 5. Países ─────────────────────────────────────────────
+def plot_countries(df, out, top_n=20):
+    c: Counter = Counter()
+    col = "openalex_country_code" if "openalex_country_code" in df.columns else "country"
+    for s in df[col]:
+        for part in re.split(r"[;,]", s):
+            code = part.strip()
+            if not code:
+                code = _guess_country(s) or ""
+            if len(code) == 2:
+                c[code.upper()] += 1
+    if not c:
+        return None, pd.DataFrame({"Nota":["Dados de países indisponíveis."]})
+    top = c.most_common(top_n)
+    labels, vals = zip(*top)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.barh(labels[::-1], vals[::-1],
+                   color=plt.cm.Set2(np.linspace(0, 1, len(labels))))
+    ax.set(xlabel="Publicações", title=f"Top {top_n} Países")
+    ax.bar_label(bars, padding=3)
+    plt.tight_layout()
+    path = savefig(os.path.join(out, "05_paises.png"))
+    return path, pd.DataFrame(top, columns=["País (ISO2)", "Publicações"])
+
+# ── 6. Rede de coautoria ──────────────────────────────────
+def plot_coauthorship(df, out, min_deg=1):
+    G = nx.Graph()
+    for _, row in df.iterrows():
+        authors = parse_authors(row["author"])
+        for a in authors: G.add_node(a)
+        for a1, a2 in combinations(authors, 2):
+            if G.has_edge(a1, a2): G[a1][a2]["weight"] += 1
+            else: G.add_edge(a1, a2, weight=1)
+
+    keep = [n for n, d in G.degree() if d >= min_deg]
+    G2 = G.subgraph(keep).copy() if keep else G
+
+    fig, ax = plt.subplots(figsize=(14, 12))
+    pos = nx.spring_layout(G2, k=1.3, seed=42)
+    degs = dict(G2.degree())
+    nx.draw_networkx_edges(G2, pos, alpha=0.3, edge_color="#888", ax=ax)
+    nx.draw_networkx_nodes(G2, pos,
+        node_size=[200 + degs[n]*180 for n in G2.nodes()],
+        node_color=list(degs.values()), cmap=plt.cm.YlOrRd, alpha=0.85, ax=ax)
+    nx.draw_networkx_labels(G2, pos, font_size=7, ax=ax)
+    ax.set_title("Rede de Coautoria"); ax.axis("off")
+    plt.tight_layout()
+    path = savefig(os.path.join(out, "06_rede_coautoria.png"))
+    deg_df = pd.DataFrame(sorted(degs.items(), key=lambda x:x[1], reverse=True),
+                          columns=["Autor","Grau"])
+    return path, deg_df
+
+# ── 7. Rede de cocitação ──────────────────────────────────
+def plot_cocitation(df, out):
+    G = nx.Graph()
+    titles = df["title"].tolist()
+    auth_sets = [set(parse_authors(a)) for a in df["author"]]
+    for i in range(len(df)): G.add_node(i, label=titles[i][:55])
+    for i, j in combinations(range(len(df)), 2):
+        shared = auth_sets[i] & auth_sets[j]
+        if shared: G.add_edge(i, j, weight=len(shared))
+
+    fig, ax = plt.subplots(figsize=(14, 12))
+    pos = nx.spring_layout(G, k=1.5, seed=0)
+    labels = nx.get_node_attributes(G, "label")
+    nx.draw_networkx_edges(G, pos, alpha=0.25, edge_color="#AAA", ax=ax)
+    nx.draw_networkx_nodes(G, pos, node_size=400, node_color="#2E86AB", alpha=0.85, ax=ax)
+    nx.draw_networkx_labels(G, pos, labels=labels, font_size=6, ax=ax)
+    ax.set_title("Rede de Cocitação (autores compartilhados)"); ax.axis("off")
+    plt.tight_layout()
+    path = savefig(os.path.join(out, "07_rede_cocitacao.png"))
+    rows = [{"Artigo_i": titles[u], "Artigo_j": titles[v], "Peso": d["weight"]}
+            for u,v,d in G.edges(data=True)]
+    return path, pd.DataFrame(rows)
+
+# ── 8. Acoplamento bibliográfico ──────────────────────────
+def plot_coupling(df, out):
+    jkw: dict[str,set] = defaultdict(set)
+    for _, row in df.iterrows():
+        j = row["journal"] or "Sem periódico"
+        for kw in parse_keywords(row["keywords"]): jkw[j].add(kw)
+    journals = list(jkw)
+    G = nx.Graph()
+    for j in journals: G.add_node(j)
+    for j1, j2 in combinations(journals, 2):
+        sh = jkw[j1] & jkw[j2]
+        if sh: G.add_edge(j1, j2, weight=len(sh))
+
+    if G.number_of_edges() == 0:
+        return None, pd.DataFrame({"Nota":["Keywords ausentes — acoplamento não calculado."]})
+
+    fig, ax = plt.subplots(figsize=(14, 10))
+    pos = nx.spring_layout(G, k=2, seed=7)
+    ws = [G[u][v]["weight"] for u,v in G.edges()]
+    nx.draw_networkx_edges(G, pos, width=[w*0.5 for w in ws],
+                           alpha=0.5, edge_color="#FF6B6B", ax=ax)
+    nx.draw_networkx_nodes(G, pos, node_size=800, node_color="#4ECDC4", ax=ax)
+    nx.draw_networkx_labels(G, pos, font_size=7, ax=ax)
+    ax.set_title("Acoplamento Bibliográfico entre Periódicos"); ax.axis("off")
+    plt.tight_layout()
+    path = savefig(os.path.join(out, "08_acoplamento.png"))
+    rows = [{"Periódico_i":u,"Periódico_j":v,"Keywords_compartilhadas":d["weight"]}
+            for u,v,d in G.edges(data=True)]
+    return path, pd.DataFrame(rows)
+
+# ── 9. Palavras-chave ─────────────────────────────────────
+def plot_keywords(df, out, top_n=30):
+    c: Counter = Counter()
+    for s in df["keywords"]:
+        for kw in parse_keywords(s):
+            if len(kw) >= 3: c[kw] += 1
+    if not c:
+        for t in df["title"]:
+            for tok in tokenize(t): c[tok] += 1
+
+    top = c.most_common(top_n)
+    if not top: return None, None, pd.DataFrame()
+    labels, vals = zip(*top)
+
+    # barras
+    fig, ax = plt.subplots(figsize=(10, 10))
+    cmap = plt.cm.get_cmap("tab20", len(labels))
+    bars = ax.barh(labels[::-1], vals[::-1],
+                   color=[cmap(i) for i in range(len(labels))])
+    ax.set(xlabel="Frequência", title=f"Top {top_n} Palavras-Chave")
+    ax.bar_label(bars, padding=3)
+    plt.tight_layout()
+    path_bar = savefig(os.path.join(out, "09a_keywords_barra.png"))
+
+    # nuvem
+    wc = WordCloud(width=1200, height=600, background_color="white",
+                   colormap="viridis", max_words=150)
+    wc.generate_from_frequencies(dict(c.most_common(150)))
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ax.imshow(wc, interpolation="bilinear"); ax.axis("off")
+    ax.set_title("Nuvem de Palavras-Chave")
+    plt.tight_layout()
+    path_wc = savefig(os.path.join(out, "09b_keywords_nuvem.png"))
+
+    return path_bar, path_wc, pd.DataFrame(top, columns=["Keyword","Frequência"])
+
+# ── 10. Coocorrência de termos ────────────────────────────
+def plot_cooccurrence(df, out, top_terms=40, min_cooc=2):
+    docs = []
+    for _, row in df.iterrows():
+        toks = tokenize(row["title"] + " " + row.get("abstract",""))
+        if toks: docs.append(toks)
+
+    freq: Counter = Counter(t for d in docs for t in d)
+    vocab = {t for t,_ in freq.most_common(top_terms)}
+    cooc: Counter = Counter()
+    for doc in docs:
+        dv = list(set(t for t in doc if t in vocab))
+        for pair in combinations(dv, 2): cooc[tuple(sorted(pair))] += 1
+
+    filtered = {k:v for k,v in cooc.items() if v >= min_cooc}
+    if not filtered:
+        return None, pd.DataFrame()
+
+    G = nx.Graph()
+    for (t1,t2), w in filtered.items(): G.add_edge(t1, t2, weight=w)
+
+    fig, ax = plt.subplots(figsize=(16, 12))
+    pos = nx.spring_layout(G, k=1.5, seed=42)
+    degs = dict(G.degree())
+    nx.draw_networkx_edges(G, pos,
+        width=[G[u][v]["weight"]*0.6 for u,v in G.edges()],
+        alpha=0.4, edge_color="#999", ax=ax)
+    nx.draw_networkx_nodes(G, pos,
+        node_size=[200+degs[n]*150 for n in G.nodes()],
+        node_color=list(degs.values()), cmap=plt.cm.RdYlGn, alpha=0.9, ax=ax)
+    nx.draw_networkx_labels(G, pos, font_size=8, ax=ax)
+    ax.set_title("Rede de Coocorrência de Termos (títulos + resumos)")
+    ax.axis("off"); plt.tight_layout()
+    path = savefig(os.path.join(out, "10_coocorrencia.png"))
+    rows = [{"Termo_1":k[0],"Termo_2":k[1],"Coocorrências":v}
+            for k,v in sorted(filtered.items(), key=lambda x:-x[1])]
+    return path, pd.DataFrame(rows)
+
+# ── 11. LDA ───────────────────────────────────────────────
+def run_lda(df, out, n_topics=5):
+    from sklearn.feature_extraction.text import CountVectorizer
+    from sklearn.decomposition import LatentDirichletAllocation
+
+    corpus = [" ".join(tokenize(r["title"]+" "+r.get("abstract","")+" "+r["keywords"]))
+              for _, r in df.iterrows()]
+    n_topics = max(2, min(n_topics, len(corpus)//2))
+
+    vec = CountVectorizer(max_df=0.95, min_df=1, max_features=500)
+    X   = vec.fit_transform(corpus)
+    vocab = vec.get_feature_names_out()
+
+    lda = LatentDirichletAllocation(n_components=n_topics, random_state=42, max_iter=20)
+    lda.fit(X)
+    doc_topics = lda.transform(X)
+
+    rows = []
+    fig, axes = plt.subplots(1, n_topics, figsize=(4*n_topics, 6))
+    if n_topics == 1: axes = [axes]
+    for idx, (topic, ax) in enumerate(zip(lda.components_, axes)):
+        ti = topic.argsort()[-10:][::-1]
+        tw = [vocab[i] for i in ti]; tv = [topic[i] for i in ti]
+        ax.barh(tw[::-1], tv[::-1], color=plt.cm.tab10(idx/n_topics))
+        ax.set_title(f"Tópico {idx+1}"); ax.set_xlabel("Peso")
+        for w,v in zip(tw,tv): rows.append({"Tópico":idx+1,"Palavra":w,"Peso":round(v,4)})
+
+    plt.suptitle("LDA — Palavras por Tópico", fontsize=14, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    path = savefig(os.path.join(out, "11_lda_topicos.png"))
+
+    doc_df = pd.DataFrame(doc_topics, columns=[f"T{i+1}" for i in range(n_topics)])
+    doc_df.insert(0, "Título", df["title"].values)
+    doc_df["Tópico_Dominante"] = doc_topics.argmax(axis=1)+1
+    return path, pd.DataFrame(rows), doc_df, doc_topics, n_topics
+
+# ── 12. BERTopic ──────────────────────────────────────────
+def run_bertopic(df, out):
+    """
+    Executa BERTopic com modelo multilíngue leve.
+    Se o corpus for muito pequeno (< 5 docs), aplica fallback para LDA.
+    """
+    from bertopic import BERTopic
+    from sklearn.feature_extraction.text import CountVectorizer
+
+    docs = [clean_text(r["title"]+" "+r.get("abstract","")+" "+r["keywords"])
+            for _, r in df.iterrows()]
+    docs = [d for d in docs if len(d.split()) >= 3]
+
+    if len(docs) < 5:
+        print("    (corpus pequeno demais para BERTopic — pulando)")
+        return None, pd.DataFrame({"Nota":["Corpus insuficiente para BERTopic."]})
+
+    try:
+        from sentence_transformers import SentenceTransformer
+        model_name = "paraphrase-multilingual-MiniLM-L12-v2"
+        embedding_model = SentenceTransformer(model_name)
+    except Exception as e:
+        print(f"    Erro ao carregar SentenceTransformer: {e}")
+        embedding_model = None
+
+    cv = CountVectorizer(ngram_range=(1,2), stop_words=list(STOPWORDS))
+
+    try:
+        topic_model = BERTopic(
+            embedding_model=embedding_model,
+            vectorizer_model=cv,
+            min_topic_size=max(2, len(docs)//5),
+            verbose=False,
+        )
+        topics, _ = topic_model.fit_transform(docs)
+    except Exception as e:
+        print(f"    Erro BERTopic: {e}")
+        return None, pd.DataFrame({"Nota":[f"Erro BERTopic: {e}"]})
+
+    # Informações dos tópicos
+    topic_info = topic_model.get_topic_info()
+    # gráfico de barras dos top tópicos (excl. -1 = outliers)
+    real_topics = topic_info[topic_info["Topic"] != -1].head(10)
+    if real_topics.empty:
+        return None, topic_info
+
+    fig, ax = plt.subplots(figsize=(10, max(5, len(real_topics)*0.7)))
+    ax.barh(real_topics["Name"].values[::-1],
+            real_topics["Count"].values[::-1],
+            color=plt.cm.Set3(np.linspace(0,1,len(real_topics))))
+    ax.set(xlabel="Documentos no tópico",
+           title="BERTopic — Tópicos Detectados\n(multilíngue)")
+    plt.tight_layout()
+    path = savefig(os.path.join(out, "12_bertopic.png"))
+
+    # Tabela detalhada
+    rows = []
+    for _, trow in real_topics.iterrows():
+        tid = trow["Topic"]
+        words = topic_model.get_topic(tid)
+        if words:
+            top_words = ", ".join([w for w,_ in words[:10]])
+        else:
+            top_words = ""
+        rows.append({"Tópico": tid, "Nome": trow["Name"],
+                     "Documentos": trow["Count"], "Termos_chave": top_words})
+
+    return path, pd.DataFrame(rows)
+
+# ── 13. Tendências temáticas ──────────────────────────────
+def plot_trends(df, out, doc_topics=None, n_topics=5):
+    years = sorted(df["year_int"].unique())
+
+    if doc_topics is not None:
+        df2 = df.copy()
+        df2["dom"] = doc_topics.argmax(axis=1)+1
+        topic_by_yr = pd.DataFrame(index=years,
+            columns=[f"T{i+1}" for i in range(n_topics)], dtype=float)
+        for yr in years:
+            mask = df2["year_int"] == yr
+            for t in range(n_topics):
+                topic_by_yr.at[yr,f"T{t+1}"] = doc_topics[mask.values,t].mean()
+
+        fig, ax = plt.subplots(figsize=(13,6))
+        for col in topic_by_yr.columns:
+            ax.plot(years, topic_by_yr[col].values, marker="o", label=col, lw=2)
+        ax.set(xlabel="Ano", ylabel="Proporção média", title="Tendências Temáticas (LDA)")
+        ax.legend(title="Tópico"); ax.grid(alpha=0.3); plt.tight_layout()
+        path = savefig(os.path.join(out, "13_tendencias_lda.png"))
+        topic_by_yr.index.name = "Ano"
+        return path, topic_by_yr.reset_index()
+
+    # fallback: keywords por ano
+    kw_c: Counter = Counter()
+    for s in df["keywords"]:
+        for kw in parse_keywords(s): kw_c[kw] += 1
+    if not kw_c:
+        for t in df["title"]:
+            for tok in tokenize(t): kw_c[tok] += 1
+    top10 = [t for t,_ in kw_c.most_common(10)]
+    kw_by_yr: dict[int,Counter] = {}
+    for yr in years:
+        sub = df[df["year_int"]==yr]
+        c: Counter = Counter()
+        for s in sub["keywords"]:
+            for kw in parse_keywords(s): c[kw] += 1
+        if not c:
+            for t in sub["title"]:
+                for tok in tokenize(t): c[tok] += 1
+        kw_by_yr[yr] = c
+
+    fig, ax = plt.subplots(figsize=(14,7))
+    for term in top10:
+        ax.plot(years, [kw_by_yr.get(y,Counter()).get(term,0) for y in years],
+                marker="o", label=term, lw=1.5)
+    ax.set(xlabel="Ano", ylabel="Frequência", title="Tendências Temáticas (Top 10 termos)")
+    ax.legend(bbox_to_anchor=(1.02,1), loc="upper left", fontsize=9)
+    ax.grid(alpha=0.3); plt.tight_layout()
+    path = savefig(os.path.join(out, "13_tendencias_keywords.png"))
+    trend_df = pd.DataFrame({"Ano": years,
+        **{t:[kw_by_yr.get(y,Counter()).get(t,0) for y in years] for t in top10}})
+    return path, trend_df
+
+# ── 14. Mapa colaboração ──────────────────────────────────
+def plot_map(df, out):
+    c: Counter = Counter()
+    col = "openalex_country_code" if "openalex_country_code" in df.columns else "country"
+    for s in df[col]:
+        for part in re.split(r"[;,]", s):
+            code = part.strip().upper()
+            if len(code)==2: c[code] += 1
+    if not c:
+        return None, pd.DataFrame({"Nota":["Dados de países indisponíveis."]})
+
+    country_df = pd.DataFrame(c.most_common(), columns=["iso_alpha2","count"])
+    try:
+        import plotly.express as px
+        fig = px.choropleth(country_df, locations="iso_alpha2",
+                            locationmode="ISO-3166-1-alpha-2", color="count",
+                            color_continuous_scale="Blues",
+                            title="Mapa de Colaboração Internacional",
+                            labels={"count":"Publicações"})
+        fig.write_html(os.path.join(out, "14_mapa_colaboracao.html"))
+        print("    → Mapa interativo salvo como HTML")
+    except Exception as e:
+        print(f"    (plotly indisponível: {e})")
+    return None, country_df
+
+
+# ══════════════════════════════════════════════════════════
+# EXPORTAÇÃO XLSX
+# ══════════════════════════════════════════════════════════
+def export_xlsx(results: dict, df_base: pd.DataFrame, out_dir: str):
+    """
+    results = {
+      "Temporal":         (png_path, df),
+      "Autores":          (png_path, df),
+      ...
+    }
+    """
+    print("  → Exportando planilha Excel…")
+    wb = Workbook()
+    wb.remove(wb.active)   # remove sheet padrão
+
+    # ── Aba Capa ──────────────────────────────────────────
+    ws_cover = wb.create_sheet("Capa")
+    ws_cover.sheet_view.showGridLines = False
+    ws_cover.column_dimensions["A"].width = 60
+    ws_cover.row_dimensions[1].height = 40
+
+    ws_cover["A1"] = "RELATÓRIO BIBLIOMÉTRICO — PORTAL CAPES"
+    ws_cover["A1"].font      = Font(bold=True, size=18, name="Arial", color="1F4E79")
+    ws_cover["A1"].alignment = CENTER
+
+    info = [
+        ("Total de registros", len(df_base)),
+        ("Período", f'{df_base["year_int"].min()} – {df_base["year_int"].max()}'),
+        ("Data da análise", pd.Timestamp.today().strftime("%d/%m/%Y")),
+        ("Fonte", "Portal CAPES + OpenAlex"),
+    ]
+    for i, (k,v) in enumerate(info, start=3):
+        ws_cover[f"A{i}"] = f"{k}: {v}"
+        ws_cover[f"A{i}"].font      = Font(size=12, name="Arial", color="2E75B6")
+        ws_cover[f"A{i}"].alignment = LEFT
+        ws_cover.row_dimensions[i].height = 20
+
+    # Índice de abas
+    ws_cover["A9"] = "CONTEÚDO DA PLANILHA"
+    ws_cover["A9"].font = Font(bold=True, size=13, name="Arial", color="1F4E79")
+    ws_cover.row_dimensions[9].height = 20
+    abas = list(results.keys())
+    for i, a in enumerate(abas, start=10):
+        ws_cover[f"A{i}"] = f"  • {a}"
+        ws_cover[f"A{i}"].font      = Font(size=11, name="Arial")
+        ws_cover[f"A{i}"].alignment = LEFT
+
+    # ── Aba Base de Dados ──────────────────────────────────
+    ws_data = wb.create_sheet("Base de Dados")
+    cols_show = [c for c in df_base.columns
+                 if c not in ("ENTRYTYPE","ID") and not c.startswith("doi")]
+    write_df_to_sheet(ws_data, df_base[cols_show].fillna(""), "Registros Bibliográficos")
+
+    # ── Abas de análise ───────────────────────────────────
+    for sheet_name, (png_path, df_res) in results.items():
+        ws = wb.create_sheet(sheet_name[:31])   # Excel limita a 31 chars
+        ws.sheet_view.showGridLines = False
+
+        if df_res is not None and not df_res.empty:
+            write_df_to_sheet(ws, df_res.fillna("").astype(str), sheet_name)
+
+        # Inserir imagem PNG abaixo da tabela
+        if png_path and os.path.exists(png_path):
+            img_row = ws.max_row + 2
+            try:
+                img = XLImage(png_path)
+                img.width  = min(img.width,  900)
+                img.height = min(img.height, 600)
+                ws.add_image(img, f"A{img_row}")
+                ws.row_dimensions[img_row].height = img.height * 0.75
+            except Exception as e:
+                ws[f"A{img_row}"] = f"(imagem não inserida: {e})"
+
+    # ── Aba LDA extra (documentos) ─────────────────────────
+    if "LDA – Documentos" in results:
+        pass   # já incluído em results
+
+    xlsx_path = os.path.join(out_dir, "relatorio_bibliometrico.xlsx")
+    wb.save(xlsx_path)
+    print(f"  ✓ Planilha salva: {xlsx_path}")
+    return xlsx_path
+
+
+# ══════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════
+def main():
+    print("=" * 62)
+    print("  ANÁLISE BIBLIOMÉTRICA — PORTAL CAPES  v2.0")
+    print("=" * 62)
+
+    base_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
+    print(f"\nPasta: {base_dir}")
+
+    paths = find_bib_files(BIB_PATTERN, MAX_FILES, base_dir)
+    if not paths:
+        sys.exit(f"Nenhum .bib encontrado em: {base_dir}")
+    print(f"Arquivos ({len(paths)}):")
+    for p in paths: print(f"  {p}")
+
+    print("\nCarregando…")
+    df = load_bib_files(paths)
+
+    out = os.path.join(base_dir, OUTPUT_DIR)
+    os.makedirs(out, exist_ok=True)
+
+    # ── Pergunta sobre enriquecimento ──────────────────────
+    print("\n──────────────────────────────────────────────")
+    ans = input("Enriquecer com OpenAlex via DOI? (s/n) [s]: ").strip().lower()
+    if ans in ("", "s", "sim", "y", "yes"):
+        email = input(f"  E-mail para polite pool [{OPENALEX_EMAIL}]: ").strip()
+        if not email:
+            email = OPENALEX_EMAIL
+        df = enrich_with_openalex(df, email)
+    print("──────────────────────────────────────────────\n")
+
+    print("Gerando análises…\n")
+    results = {}   # sheet_name → (png_path, df)
+
+    # 1. Temporal
+    p, d = plot_temporal(df, out)
+    results["1. Temporal"] = (p, d.rename("Publicações").reset_index().rename(
+        columns={"year_int":"Ano"}))
+
+    # 2. Autores
+    p, d = plot_authors(df, out)
+    results["2. Autores"] = (p, d)
+
+    # 3. Periódicos
+    p, d = plot_journals(df, out)
+    results["3. Periódicos"] = (p, d)
+
+    # 4. Instituições
+    print("  → Instituições mais produtivas")
+    p, d = plot_institutions(df, out)
+    results["4. Instituições"] = (p, d)
+
+    # 5. Países
+    print("  → Países mais produtivos")
+    p, d = plot_countries(df, out)
+    results["5. Países"] = (p, d)
+
+    # 6. Rede coautoria
+    print("  → Rede de coautoria")
+    p, d = plot_coauthorship(df, out)
+    results["6. Coautoria"] = (p, d)
+
+    # 7. Cocitação
+    print("  → Rede de cocitação")
+    p, d = plot_cocitation(df, out)
+    results["7. Cocitação"] = (p, d)
+
+    # 8. Acoplamento
+    print("  → Acoplamento bibliográfico")
+    p, d = plot_coupling(df, out)
+    results["8. Acoplamento"] = (p, d)
+
+    # 9. Keywords
+    print("  → Análise de palavras-chave")
+    pb, pwc, d = plot_keywords(df, out)
+    results["9a. Keywords Barra"]  = (pb,  d)
+    results["9b. Keywords Nuvem"]  = (pwc, None)
+
+    # 10. Coocorrência
+    print("  → Coocorrência de termos")
+    p, d = plot_cooccurrence(df, out)
+    results["10. Coocorrência"] = (p, d)
+
+    # 11. LDA
+    print("  → Modelagem de tópicos (LDA)")
+    p_lda, d_words, d_docs, doc_topics, n_t = run_lda(df, out)
+    results["11. LDA – Palavras"]   = (p_lda, d_words)
+    results["11. LDA – Documentos"] = (None,  d_docs)
+
+    # 12. BERTopic
+    print("  → Modelagem de tópicos (BERTopic)")
+    p_bert, d_bert = run_bertopic(df, out)
+    results["12. BERTopic"] = (p_bert, d_bert)
+
+    # 13. Tendências
+    print("  → Tendências temáticas")
+    p, d = plot_trends(df, out, doc_topics, n_t)
+    results["13. Tendências"] = (p, d)
+
+    # 14. Mapa
+    print("  → Mapa de colaboração internacional")
+    p, d = plot_map(df, out)
+    results["14. Mapa"] = (p, d)
+
+    # ── Exportar XLSX ──────────────────────────────────────
+    print()
+    xlsx = export_xlsx(results, df, out)
+
+    print(f"\n{'='*62}")
+    print(f"  ✅  CONCLUÍDO!")
+    print(f"  📊  Planilha : {xlsx}")
+    print(f"  🖼   PNGs     : {out}/")
+    print(f"{'='*62}\n")
+
+
+if __name__ == "__main__":
+    main()
